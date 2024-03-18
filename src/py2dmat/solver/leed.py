@@ -26,11 +26,12 @@ import numpy as np
 
 import py2dmat
 from py2dmat import exception
+import subprocess
 
 
 class Solver(py2dmat.solver.SolverBase):
-    path_to_solver: Path
-
+    path_to_first_solver: Path
+    path_to_second_solver: Path
     dimension: int
 
     def __init__(self, info: py2dmat.Info):
@@ -39,16 +40,20 @@ class Solver(py2dmat.solver.SolverBase):
         self._name = "leed"
         info_s = info.solver
 
+        # With or without work directory generation
+        self.remove_work_dir = info_s["post"].get("remove_work_dir", False)
+
         # Check keywords
         def check_keywords(key, segment, registered_list):
             if (key in registered_list) is False:
                 msg = "Error: {} in {} is not correct keyword.".format(key, segment)
                 raise RuntimeError(msg)
 
-        keywords_solver = ["name", "config", "reference"]
+        keywords_solver = ["name", "config", "reference", "post"]
         keywords = {}
-        keywords["config"] = ["path_to_solver"]
+        keywords["config"] = ["path_to_first_solver","path_to_second_solver"]
         keywords["reference"] = ["path_to_base_dir"]
+        keywords["post"] = ["remove_work_dir"]
 
         for key in info_s.keys():
             check_keywords(key, "solver", keywords_solver)
@@ -57,22 +62,35 @@ class Solver(py2dmat.solver.SolverBase):
             for key_child in info_s[key].keys():
                 check_keywords(key_child, key, keywords[key])
 
-        # Set environment
-        p2solver = info_s["config"].get("path_to_solver", "satl2.exe")
-        if os.path.dirname(p2solver) != "":
+        # Set new environment
+        p1solver = info_s["config"].get("path_to_first_solver", "satl1.exe")
+        if os.path.dirname(p1solver) != "":
             # ignore ENV[PATH]
-            self.path_to_solver = self.root_dir / Path(p2solver).expanduser()
+            self.path_to_first_solver = self.root_dir / Path(p1solver).expanduser()
         else:
             for P in itertools.chain([self.root_dir], os.environ["PATH"].split(":")):
-                self.path_to_solver = Path(P) / p2solver
-                if os.access(self.path_to_solver, mode=os.X_OK):
+                self.path_to_first_solver = Path(P) / p1solver
+                if os.access(self.path_to_first_solver, mode=os.X_OK):
                     break
-        if not os.access(self.path_to_solver, mode=os.X_OK):
+        if not os.access(self.path_to_first_solver, mode=os.X_OK):
+            raise exception.InputError(f"ERROR: solver ({p1solver}) is not found")
+
+        # Set environment
+        p2solver = info_s["config"].get("path_to_second_solver", "satl2.exe")
+        if os.path.dirname(p2solver) != "":
+            # ignore ENV[PATH]
+            self.path_to_second_solver = self.root_dir / Path(p2solver).expanduser()
+        else:
+            for P in itertools.chain([self.root_dir], os.environ["PATH"].split(":")):
+                self.path_to_second_solver = Path(P) / p2solver
+                if os.access(self.path_to_second_solver, mode=os.X_OK):
+                    break
+        if not os.access(self.path_to_second_solver, mode=os.X_OK):
             raise exception.InputError(f"ERROR: solver ({p2solver}) is not found")
 
         self.path_to_base_dir = info_s["reference"]["path_to_base_dir"]
         # check files
-        files = ["exp.d", "rfac.d", "tleed4.i", "tleed5.i", "tleed.o", "short.t"]
+        files = ["exp.d", "rfac.d", "tleed4.i", "tleed5.i"]
         for file in files:
             if not os.path.exists(os.path.join(self.path_to_base_dir, file)):
                 raise exception.InputError(
@@ -81,17 +99,27 @@ class Solver(py2dmat.solver.SolverBase):
         self.input = Solver.Input(info)
 
     def prepare(self, message: py2dmat.Message) -> None:
-        self.work_dir = self.proc_dir
+        subdir = self.input.subdir(message)
+        self.work_dir = self.proc_dir / Path(subdir)
         for dir in [self.path_to_base_dir]:
             copy_tree(os.path.join(self.root_dir, dir), os.path.join(self.work_dir))
+        cwd = os.getcwd()
+        os.chdir(self.work_dir)
         self.input.prepare(message)
+        os.chdir(cwd)
+    
 
     def run(self, nprocs: int = 1, nthreads: int = 1) -> None:
-        self._run_by_subprocess([str(self.path_to_solver)])
+        try:
+            super()._run_by_subprocess([str(self.path_to_first_solver)])
+            super()._run_by_subprocess([str(self.path_to_second_solver)])
+        except subprocess.CalledProcessError:
+            print("エラーが発生しました")
 
     def get_results(self) -> float:
         # Get R-factor
-        rfactor = -1.0
+        if not os.path.exists(os.path.join(self.work_dir, "iv 1")):
+           rfactor = float('inf')
         filename = os.path.join(self.work_dir, "search.s")
         with open(filename, "r") as fr:
             lines = fr.readlines()
@@ -99,42 +127,53 @@ class Solver(py2dmat.solver.SolverBase):
                 if "R-FACTOR" in line:
                     rfactor = float(line.split("=")[1])
                     break
-        if rfactor == -1.0:
-            msg = f"R-FACTOR cannot be found in {filename}"
-            raise RuntimeError(msg)
+
+        #remove work directory 
+        if self.remove_work_dir == "true":
+            shutil.rmtree(self.work_dir)
         return rfactor
+        
+        
 
     class Input(object):
         root_dir: Path
         output_dir: Path
         dimension: int
+        string_list: List[str]
 
         def __init__(self, info):
             self.dimension = info.base["dimension"]
             self.root_dir = info.base["root_dir"]
             self.output_dir = info.base["output_dir"]
 
-        def prepare(self, message: py2dmat.Message):
+        #Prepare directory names for each point calculation to be stored in a separate directory
+        def _pre_dir(self, Log_number, iset):
+            folder_name = "Log{:08d}_{:08d}".format(Log_number, iset)
+            os.makedirs(folder_name, exist_ok=True)
+            return folder_name
+
+        #Create subdirectories
+        def subdir(self, message: py2dmat.Message):
             x_list = message.x
             step = message.step
-            extra = message.set > 0
-            # Delete output files
-            delete_files = ["search.s", "gleed.o"]
-            for file in delete_files:
-                if os.path.exists(file):
-                    os.remove(file)
-            # Generate fit file
-            # Add variables by numpy array.(Variables are updated in optimization process).
-            self._write_fit_file(x_list)
+            iset = message.set
+            folder_name = self._pre_dir(step, iset)
+            return folder_name
+
+        def prepare(self, message: py2dmat.Message):
+            x_list = message.x
+            self._write_fit_file(x_list)    
+
 
         def _write_fit_file(self, variables):
-            with open("tleed4.i", "r") as fr:
+            with open("tleed5.i", "r") as fr:
                 contents = fr.read()
             for idx, variable in enumerate(variables):
-                # FORTRAN format: F7.6
-                svariable = str(variable).zfill(6)[:6]
+            # FORTRAN format: F7.4
+                svariable = "{:7.4f}".format(float(variable))
                 contents = contents.replace(
-                    "opt{}".format(str(idx).zfill(3)), svariable
+                    "opt{}".format(str(idx).zfill(4)), svariable
                 )
-            with open("tleed4.i", "w") as writer:
+
+            with open("tleed5.i", "w") as writer:
                 writer.write(contents)
